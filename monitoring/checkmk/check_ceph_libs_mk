@@ -38,6 +38,8 @@ import psutil
 import sys
 import argparse
 import json
+import re
+import os
 
 CHECK_NAME = 'check_ceph_libs'
 
@@ -71,15 +73,59 @@ def check_result(msg, status):
     sys.exit(0)
 
 
+def check_qemu_process(cmdline):
+    """
+    An ugly function to determine if a QEMU process needs to be checked or not
+
+    Only check QEMU instances with rbd or archipelago disks
+    """
+    ret = False
+
+    regex = re.compile(r'-drive file=([\d\w\-\.:/]+)')
+    results = regex.findall(' '.join(cmdline))
+    if results:
+        for disk in results:
+            if 'rbd' in disk:
+                ret = True
+            else:
+                if os.path.exists(disk):
+                    if 'tapdev' in os.path.realpath(disk):
+                        ret = True
+
+    return ret
+
+
+def check_process(proc, procs_to_check):
+    """
+    Determine if a given process should be checked or not
+
+    GRNET-specific rules in this function
+    """
+    check_proc = False
+    if any(x in proc['name'] for x in procs_to_check):
+        if proc['name'] == 'qemu-system-x86_64':
+            if check_qemu_process(proc['cmdline']):
+                check_proc = True
+        else:
+            check_proc = True
+
+    return check_proc
+
+
 def fetch_procs(procs_to_check):
     """
     Fetch all processes with name that matches entries in procs_to_check
     """
-    procs = [
-        p.as_dict()
-        for p in psutil.process_iter()
-        if any(x in p.as_dict()['name'] for x in procs_to_check)
-    ]
+    procs = []
+    for p in psutil.process_iter():
+        # It is possible that a process found by process_iter() has died.
+        # Catch that exception and ignore it.
+        try:
+            _pinfo = p.as_dict()
+        except psutil.NoSuchProcess:
+            continue
+        if check_process(_pinfo, procs_to_check):
+            procs.append(_pinfo)
 
     return procs
 
@@ -150,6 +196,8 @@ def main():
     try:
         # Fetch all processes using ceph-related libraries
         procs = fetch_procs(PROCS_TO_CHECK)
+        if not procs:
+            check_result('No processes matches on node', 'OK')
 
         # Find processes running old libraries
         procs_old_libs = find_procs_old_libs(procs, LIBS_TO_CHECK)
@@ -164,7 +212,7 @@ def main():
                 check_result('{} processes running with old Ceph libraries.'
                              .format(len(procs_old_libs['processes'])), 'WARNING')
             else:
-                check_result('All processes are running latest installed libs', 'OK')
+                check_result('All processes are running the latest installed libs', 'OK')
 
     except Exception as e:
         check_result('Something went wrong: {}'.format(str(e)), 'UNKNOWN')
