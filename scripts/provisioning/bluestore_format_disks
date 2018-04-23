@@ -1,0 +1,346 @@
+#!/bin/bash
+#
+# bluestore_format_disks - Format disks for Ceph Bluestore deployment
+#
+# This script is quite specific for GRNET's latest Ceph deployment and is not
+# intended to be used in other deployments 'as-is'. It prepares all disks for
+# Bluestore because ceph-volume cannot handle (yet) partitioning and
+# PV creations. This script was primarily used for (re)creating clusters with
+# different disk layouts.
+#
+# Arguments:
+#   $1: Total OSDs per host (default: 12)
+#   $2: Total SSDs per host (default: 6)
+#   $3: DB LVs per SSD (default: 6)
+#   $4: Format SSDs for OSD use (default: yes)
+#
+# Description:
+#   * Discover disks (disks for HDD OSDs, SSD OSDs, SSD DBs, system)
+#   * Wipe all disks except $IGNORE_HDD
+#     * Remove all VGs (+LVs)
+#     * Remove all PVs
+#     * Run ceph-volume lvm zap
+#   * For HDDs on the node, do the following:
+#     * Create GPT
+#     * Create 1 partition
+#     * Create PV on partition
+#     * Create LV on VG
+#     This is needed for ceph-volume, because it does not understand raw
+#     devices and awaits a PV for the osd's data disk. $HDD_COUNT defines the
+#     number of HDDs on a SC. We also do the above only for HDD models defined
+#     in $HDD_MODELS.
+#   * Create db partitions for Bluestore
+#     There are multiple possible layouts for a Bluestore deployment. In our
+#     fleet, all SCs have 6x SSD drives. $SSD_COUNT defines how many SSDs will
+#     be used to store DB's on them. $DB_PER_SSD defines how many DBs each SSD
+#     will host. For each SSD do the following:
+#     * Create GPT
+#     * Create 1 partition
+#     * Create PV on partition
+#     * Create VG on disk with additional tag wwn=$WWN
+#     * Create $DB_PER_SSD LVs on VG
+#   * If applicable, format SSDs for OSD usage
+#     * Same as HDD OSDs
+#
+# Naming Scheme:
+#   HDDs
+#     VGs:
+#       Name: bs_hdd_$SERIAL
+#       Tags: serial=$SERIAL,type=HDD
+#     LVs
+#       block:
+#         Name: bs_hdd_$SERIAL_block_$ID (ID=arbitrary number)
+#         Tags: block.db_lv=$LV_of_block.db,
+#               block.db_vg=$VG_of_block.db,
+#               serial=$SERIAL, type=HDD
+#   SSDs
+#     VGs:
+#       Name: bs_ssd_$SERIAL
+#       Tags: serial=$SERIAL,type=SSD
+#     LVs
+#       block:
+#         Name: bs_ssd_$SERIAL_block_$ID (ID=arbitrary number)
+#         Tags: block.db_lv=$LV_of_block.db,
+#               block.db_vg=$VG_of_block.db,
+#               serial=$SERIAL, type=SSDD
+#       block.db:
+#         Name: bs_ssd_$SERIAL_block_db_$ID (ID=arbitrary number)
+#         Tags: block_lv=$LV_of_block, block_vg=$VG_of_block,
+#               serial=$SERIAL, type=SSD
+#
+#
+# Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+# Copyright (c) 2018 GRNET - Greek Research and Technology Network
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -e
+
+function pprint() {
+    printf "[${HOSTNAME}] ${COLOR}$1${NC}\n"
+}
+
+function wipe_disk() {
+    disk=$1
+    pprint "==> Wiping ${disk}"
+
+    pprint "==> Wiping VGs"
+    for vg in `vgs --noheadings -o name | grep -v $IGNORE_VG`;
+    do
+        pprint "===> Wiping VG ${vg}"
+        vgremove -y ${vg}
+    done
+
+    pprint "==> Wiping PVs"
+    for pv in `pvs --noheadings -o name,vg_name | grep -v $IGNORE_VG`;
+    do
+        pprint "===> Wiping PV ${pv}"
+        pvremove -y ${pv}
+    done
+
+    pprint "==> Zapping $disk"
+    ceph-volume lvm zap $disk
+
+    pprint "==> Done with $disk"
+    echo
+}
+
+function create_gpt() {
+    disk=$1
+    pprint "==> Creating GPT partition table"
+    parted --script $disk mklabel gpt
+}
+
+function create_partition() {
+    disk=$1
+    pprint "==> Creating primary partition on $disk"
+    parted --script $disk mkpart primary 1 100%
+}
+
+function create_pv() {
+    PV=$1
+    pprint "===> Creating PV ${PV}"
+    pvcreate $PV
+}
+
+function create_vg() {
+    PV=$1
+    VG=$2
+    TAG=$3
+    pprint "===> Creating VG ${VG} on ${PV}"
+    vgcreate --addtag ${TAG} ${VG} ${PV}
+}
+
+function create_lv() {
+    LV=$1
+    VG=$2
+    TAG=$3
+    SIZE=$4
+    pprint "====> Create LV ${LV} on ${VG}"
+    lvcreate -L ${SIZE} ${VG} -n ${LV} --addtag ${TAG}
+}
+
+COLOR='\033[1;32m'
+NC='\033[0m'
+
+DB_LV_PREFIX=bs_ssd
+SSD_MODEL=LT0200MO
+HDD_MODELS=(ST4000NM0023 MG03SCA400 MG04SCA40ENY)
+IGNORE_VG=local
+IGNORE_HDD="PERC H730 Mini"
+DB_SIZE=25G
+HOSTNAME=`hostname`
+
+OSDS_PER_HOST=${1:-12}
+TOTAL_SSDS=${2:-6}
+DBS_PER_SSD=${3:-6}
+CREATE_SSD_POOL=${4:-yes}
+
+# Calculate how many SSDs we have for separate pool
+if [[ "$DBS_PER_SSD" != "0" ]];
+then
+    EMPTY_SSD_COUNT=$(($TOTAL_SSDS - ($OSDS_PER_HOST / $DBS_PER_SSD)))
+    DB_SSD_COUNT=$(($TOTAL_SSDS - $EMPTY_SSD_COUNT))
+else
+    EMPTY_SSD_COUNT=$TOTAL_SSDS
+    DB_SSD_COUNT=0
+fi
+
+# Fail if user requested SSD pool and none is left
+if [[ "$EMPTY_SSD_COUNT" == "0" ]] && [[ "$CREATE_SSD_POOL" == "yes" ]];
+then
+    echo "No SSDs left for separate pool"
+    exit 1
+fi
+
+# Fetch all OSD disks
+OSD_HDDS=(`lsblk -o name,model --noheadings --nodeps | grep \`for i in "${HDD_MODELS[@]}"; do echo -n "-e ${i} "; done\` | awk '{print $1}'`)
+if [[ "${#OSD_HDDS[@]}" != "${OSDS_PER_HOST}" ]];
+then
+    echo "Found ${#OSD_HDDS[@]} HDDs for OSDs on host instead of ${OSDS_PER_HOST}"
+    exit 1
+fi
+
+# Fetch all SSDs
+# TODO Check if SSD_DISKS == TOTAL_SSDS
+SSD_DISKS=(`lsblk -o name,model --noheadings --nodeps | grep "$SSD_MODEL"| awk '{print $1}'`)
+
+# TODO Check if only one is found
+# Fetch system disk
+SYSTEM_DISK=(`lsblk -o name,model --nodeps --noheadings | grep "$IGNORE_HDD" | awk '{print $1}'`)
+
+# Fetch all disks except of system disk
+# TODO Check if OSDS_PER_HOST + TOTAL_SSDS == ALL_CEPH_DISKS
+ALL_CEPH_DISKS=(`lsblk -o name,model --nodeps --noheadings  | grep -v "$IGNORE_HDD" | awk '{print $1}'`)
+
+# List of SSDs for DBs and pool
+if [[ "$DB_SSD_COUNT" != "0" ]];
+then
+    SSDS_FOR_DBS=("${SSD_DISKS[@]:0:$DB_SSD_COUNT}")
+    SSDS_FOR_POOL=("${SSD_DISKS[@]:$DB_SSD_COUNT}")
+else
+    SSDS_FOR_DBS=()
+    SSDS_FOR_POOL=("${SSD_DISKS[@]}")
+fi
+
+pprint "=> Info"
+pprint "== HDDs: ${#OSD_HDDS[@]}"
+pprint "== SSDs: ${#SSD_DISKS[@]}"
+pprint "== DBs per SSD: ${DBS_PER_SSD}"
+pprint "== SSDs for pool: ${#SSDS_FOR_POOL[@]}"
+pprint "== System disk: ${SYSTEM_DISK}"
+pprint "== HDDs: ${OSD_HDDS[*]}"
+pprint "== DB SSDs: ${SSDS_FOR_DBS[*]}"
+pprint "== Pool SSDs: ${SSDS_FOR_POOL[*]}"
+
+pprint "=> Unmount all tmpfs dirs"
+umount /var/lib/ceph/osd/* || true
+
+pprint "=> Wiping all disks"
+for disk in "${ALL_CEPH_DISKS[@]}";
+do
+    wipe_disk /dev/$disk
+done
+
+echo
+pprint "=> Starting HDD formatting"
+BLOCK_LVS=()
+count=0
+for disk in "${OSD_HDDS[@]}";
+do
+    HDD=/dev/${disk}
+    WWN=`lsblk -o wwn --noheadings /dev/${disk}`
+    SERIAL=`sg_inq /dev/${disk} | grep "Unit serial number" | awk '{print $4}'`
+    PV=${HDD}1
+    VG=bs_hdd_${SERIAL}
+    LV=bs_hdd_${SERIAL}_block_0
+
+    create_gpt $HDD
+    create_partition $HDD
+
+    pprint "==> Sleeping for a while"
+    sleep 5
+
+    pprint "==> Formatting ${HDD}..."
+
+    create_pv $PV
+    create_vg ${PV} ${VG} "serial=${SERIAL}"
+
+    pprint "====> Create LV ${LV} on ${VG}"
+    lvcreate -l 100%FREE ${VG} -n ${LV}
+    lvchange ${VG}/${LV} --addtag serial=${SERIAL}
+
+    BLOCK_LVS+=(${LV})
+    count=$(($count + 1))
+done
+
+echo
+pprint "=> Starting DB SSD formatting"
+
+count=0
+_id=0
+for disk in "${SSDS_FOR_DBS[@]}";
+do
+    WWN=`lsblk -o wwn --noheadings /dev/${disk}`
+    SERIAL=`sg_inq /dev/${disk} | grep "Unit serial number" | awk '{print $4}'`
+    VG=bs_ssd_${SERIAL}
+    HDD=/dev/${disk}
+    PV=${HDD}1
+
+    create_gpt $HDD
+    create_partition $HDD
+
+    pprint "==> Sleeping for a while"
+    sleep 5
+
+    pprint "==> Formatting ${HDD}..."
+
+    create_pv $PV
+    create_vg ${PV} ${VG} "serial=${SERIAL}"
+
+    pprint "===> Create LVs on ${VG}"
+    for id in `seq 0 $(($DBS_PER_SSD-1))`;
+    do
+        DB=${DB_LV_PREFIX}_${SERIAL}_db_${id}
+        HDD_VG=`echo ${BLOCK_LVS[${_id}]} | sed 's/_block_0//g'`
+        HDD_LV=${BLOCK_LVS[${_id}]}
+
+        create_lv ${DB} ${VG} "serial=${SERIAL}" ${DB_SIZE}
+        lvchange ${VG}/${DB} --addtag block_lv=${HDD_LV}
+        lvchange ${VG}/${DB} --addtag block_vg=${HDD_VG}
+
+        lvchange ${HDD_VG}/${HDD_LV} --addtag block.db_lv=${DB}
+        lvchange ${HDD_VG}/${HDD_LV} --addtag block.db_vg=${VG}
+        _id=$(($_id + 1))
+
+    done
+
+    pprint "==> Done with ${HDD}"
+    echo
+    count=$(($count + 1))
+done
+
+if [[ "$CREATE_SSD_POOL" == "yes" ]];
+then
+    echo
+    pprint "=> Starting SSD pool formatting"
+    count=0
+    for disk in "${SSDS_FOR_POOL[@]}";
+    do
+        SERIAL=`sg_inq /dev/${disk} | grep "Unit serial number" | awk '{print $4}'`
+        HDD=/dev/${disk}
+        PV=${HDD}1
+        VG=bs_ssd_${SERIAL}
+        LV=bs_ssd_${SERIAL}_block_0
+
+        create_gpt $HDD
+        create_partition $HDD
+
+        pprint "==> Sleeping for a while"
+        sleep 5
+
+        pprint "==> Formatting ${HDD}..."
+
+        create_pv $PV
+        create_vg ${PV} ${VG} "serial=${SERIAL}"
+
+        pprint "====> Create LV ${LV} on ${VG}"
+        lvcreate -l 100%FREE ${VG} -n ${LV}
+        lvchange ${VG}/${LV} --addtag serial=${SERIAL}
+        lvchange ${VG}/${LV} --addtag block.db_lv=
+        lvchange ${VG}/${LV} --addtag block.db_vg=
+
+        count=$(($count + 1))
+    done
+fi
