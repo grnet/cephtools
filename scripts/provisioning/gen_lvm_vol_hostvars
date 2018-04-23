@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+gen_lvm_vol_hostvars: Generate lvm_volume host_vars for ceph-ansible
+
+Description:
+    ceph-ansible needs to in advance all partitions, LVs and VGs for OSD
+    nodes in order to provision OSDs on it. Because we create all these
+    entities using bluestore_format_disks.sh, we have to pass this info to
+    Ansible. This script looks for ceph-related LVs and generates a YAML
+    file which should act as host_vars for a node.
+
+Usage:
+    ./gen_lvm_vol_hostvars
+
+Requirements:
+    python3
+
+Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+Copyright (c) 2018 GRNET - Greek Research and Technology Network
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+import subprocess
+import json
+import re
+import sys
+import argparse
+import yaml
+
+
+def lvm_split_tags(s):
+    """
+    Parse output from LVM2_LV_TAGS from an LV and convert it to a dict.
+    """
+    tags = {}
+    for t in s.split(','):
+        current_tag = t.split('=')
+        name = current_tag[0]
+
+        # It's possible that a tag has not a value
+        if len(current_tag) == 2:
+            value = current_tag[1]
+        else:
+            value = ''
+
+        tags[name] = value
+    return tags
+
+
+def run_process(cmd):
+    """
+    Small wrapper around subprocess.check_output()
+    """
+    try:
+        p = subprocess.check_output(cmd.split(), stderr=subprocess.STDOUT)
+    except Exception as e:
+        print('Error while running {}: {}'.format(' '.join(cmd), str(e)))
+        sys.exit(1)
+
+    return p.decode('utf-8')
+
+
+def main():
+    # Run lvs to get data about all LVs
+    p = run_process('/sbin/lvs --noheadings --nameprefixes -o name,tags,vg_name')
+    fqdn = run_process('/bin/hostname -f').strip()
+
+    # Create list of dicts for all LVs
+    lvs = [
+        dict((m[0], m[1]) for m in re.findall(r"([^\s,=\']*)='([^\']*)'", l))
+            for l in p.splitlines()
+    ]
+
+    for lv in lvs:
+        if not 'LVM2_LV_TAGS' in lv:
+            print('LVM2_LV_TAGS not found in {}. Exiting.'.format(lv))
+            sys.exit(1)
+        # Split tags which come in the following format
+        # tag1=val1,tag2=val2
+        lv['LVM2_LV_TAGS'] = lvm_split_tags(lv['LVM2_LV_TAGS'])
+
+    d = []
+    for lv in lvs:
+        if lv['LVM2_LV_NAME'].startswith('bs_hdd_'):
+            d.append({
+                'data': lv['LVM2_LV_NAME'],
+                'data_vg': lv['LVM2_VG_NAME'],
+                'db_vg': lv['LVM2_LV_TAGS']['block.db_vg'],
+                'db': lv['LVM2_LV_TAGS']['block.db_lv']
+            })
+        elif re.match(r'bs_ssd_[\w\d]+_block_[0-9]+', lv['LVM2_LV_NAME']):
+            d.append({
+                'data': lv['LVM2_LV_NAME'],
+                'data_vg': lv['LVM2_VG_NAME'],
+            })
+
+    final = {
+        'lvm_volumes': d
+    }
+
+    with open('{}.yml'.format(fqdn), 'w+') as f:
+        yaml.dump(final, f, indent=2, default_flow_style=False)
+
+if __name__ == "__main__":
+    main()
