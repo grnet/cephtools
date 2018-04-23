@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+check_ceph_health: Check the status of a Ceph cluster
+
+Description:
+    Local check_mk check which checks the status of a Ceph cluster. It checks
+    for the following:
+    * Health messages [1] that have been raised by Ceph
+    * Number of MGR daemons (should be equal to mgr_daemon_count)
+    * Existence of standby MGR daemons
+
+Requirements:
+    - python3
+    - Ceph (Luminous or above)
+    - client.admin keyrings on node (no support for other users for now)
+
+Usage:
+    This script should be installed as all other local check_mk checks, as
+    stated in the official documentation [2].
+
+[1] http://docs.ceph.com/docs/master/rados/operations/health-checks/
+[2] https://mathias-kettner.de/checkmk_localchecks.html
+
+Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+Copyright (c) 2017-2018 GRNET - Greek Research and Technology Network
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+import subprocess
+import sys
+import json
+
+
+check_name = 'check_ceph_health'
+mgr_daemon_count = 3
+t = {
+    'OK': 0,
+    'WARNING': 1,
+    'CRITICAL': 2,
+    'UNKNOWN': 3
+}
+
+
+def check_result(msg, status):
+    print('{} {} - {} - {}'.format(t[status], check_name, status, msg))
+    sys.exit(0)
+
+
+def main():
+    exec_path = '/usr/bin/ceph'
+    flags = '-s -f json'
+    cmd = (exec_path + ' ' + flags).split()
+
+    try:
+        p = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10)
+    except subprocess.TimeoutExpired as e:
+        check_result('Ceph timed out. Are mon(s) failing?'.format(e), 'CRITICAL')
+    except Exception as e:
+        check_result('Error while running Ceph. Are mon(s) failing?'.format(e), 'CRITICAL')
+
+    out = p.decode('utf-8').strip()
+
+    try:
+        o = json.loads(out)
+    except Exception as e:
+        check_result('Error while parsing JSON output. Are mon(s) failing?', 'UNKNOWN')
+
+    try:
+        msg = ''
+        # Check total health status of cluster
+        hp = o['health']['status']
+        if hp == 'HEALTH_ERR':
+            failed_checks = [c for c in o['health']['checks'].items()]
+            msg = ' # '.join([c[1]['summary']['message'] for c in failed_checks])
+            status = 'CRITICAL'
+        elif hp == 'HEALTH_WARN':
+            failed_checks = [c for c in o['health']['checks'].items()]
+            msg = ' # '.join([c[1]['summary']['message'] for c in failed_checks])
+            status = 'WARNING'
+        elif hp == 'HEALTH_OK':
+            status = 'OK'
+        else:
+            status = 'UNKNOWN'
+
+        # Some special cases for mgr daemons that might be not detected by
+        # just querying ['health']['status'].
+        #
+        # No mgr daemon is active.
+        # This can be a problem for the cluster, because mgr daemons perform
+        # health-reporting tasks since Luminous (i.e. OSD status) This flag
+        # should make the check return a status of CRITICAL. When all mgr
+        # daemons are down, ceph -s reports that the cluster health is
+        # HEALTH_WARN, but we need a CRITICAL status to appear.
+        #
+        # No mgr daemons in standby mode.
+        # If there are no daemons in standby mode, we are running with only
+        # one daemon and that can be dangerous for our cluster view. Also, if
+        # some mgr daemons are down, ceph will not report it, so we have to
+        # catch it. Standby daemons should be the desired count - 1.  Ceph does
+        # not require multiple mgr daemons, so ceph -s reports that the cluster
+        # health is HEALTH_OK, but the need a WARNING status to appear.
+        #
+        # If status is UNKNOWN, something bad happened
+        if status != 'UNKNOWN':
+            if not o['mgrmap']['available']:
+                status = 'CRITICAL'
+                msg = 'All mgr daemons are down! # ' + msg
+            else:
+                standbys = len(o['mgrmap']['standbys'])
+                if standbys < mgr_daemon_count - 1:
+                    # We do not want a CRITICAL state to be set to WARNING
+                    if status == 'OK':
+                        status = 'WARNING'
+                    msg = '{} mgr down. # '.format(mgr_daemon_count - standbys - 1) + msg
+                elif standbys == 0:
+                    if status == 'OK':
+                        status = 'WARNING'
+                    msg = 'No mgr daemons in standby! # ' + msg
+
+        else:
+            check_result('Unknown state: {}'.format(hp), 'UNKNOWN')
+
+        if status == 'OK':
+            check_result("Status: {}".format(hp), 'OK')
+        else:
+            check_result("Status: {} # {}".format(hp, msg), status)
+
+    except KeyError as e:
+        check_result("Key 'health' not found in output", 'UNKNOWN')
+
+
+if __name__ == '__main__':
+    main()
