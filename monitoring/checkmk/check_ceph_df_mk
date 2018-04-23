@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+"""
+check_ceph_df: Check the total raw capacity of a cluster
+
+Description:
+    Local check_mk check which checks the total raw capacity of a cluster.
+
+Requirements:
+    - python2
+    - Ceph (Luminous or above)
+    - client.admin keyrings on node (no support for other users for now)
+
+Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+Copyright (c) 2017-2018 GRNET - Greek Research and Technology Network
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+import subprocess
+import sys
+import json
+
+check_name = 'check_ceph_df'
+t = {
+    'OK': 0,
+    'WARNING': 1,
+    'CRITICAL': 2,
+    'UNKNOWN': 3
+}
+
+crit_threshold = 80
+warn_threshold = 70
+
+
+def check_result(msg, status):
+    print('{} {} - {} - {}'.format(t[status], check_name, status, msg))
+    sys.exit(0)
+
+
+def main():
+    exec_path = '/usr/bin/ceph'
+    flags = 'df -f json'
+    cmd = (exec_path + ' ' + flags).split()
+
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p.wait()
+    out = p.communicate()
+
+    if p.returncode != 0 or out[1]:
+        check_result('Error while running ceph -s', 'ERROR')
+
+    try:
+        o = json.loads(out[0])
+    except Exception as e:
+        check_result('Error while parsing JSON output', 'UNKNOWN')
+
+    try:
+        ratio = float(o['stats']['total_used_bytes']) / float(o['stats']['total_bytes'])
+        perc = round(ratio * 100, 2)
+
+        if perc >= crit_threshold:
+            status = 'CRITICAL'
+        elif perc < crit_threshold and perc >= warn_threshold:
+            status = 'WARNING'
+        elif perc < warn_threshold:
+            status = 'OK'
+        else:
+            check_result('Unknown number: {}'.format(perc), 'UNKNOWN')
+
+        check_result('Raw usage: {}%'.format(perc), status)
+
+    except KeyError as e:
+        check_result("Keys in 'stats' not found in output", 'UNKNOWN')
+
+if __name__ == '__main__':
+    main()
