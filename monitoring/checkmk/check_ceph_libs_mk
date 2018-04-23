@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+"""
+check_ceph_libs
+
+Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+Copyright (c) 2018 GRNET - Greek Research and Technology Network
+
+Local check_mk check which checks if certain processes matching a predefined
+list, have stale ceph-related library mappings. Also includes an argument
+'--show', which dumps all faulty processes in JSON format. This argument is
+intended to be used only by the operator for debugging purposes.
+
+Usage:
+    As check_mk local script:
+        1. Place script in /usr/lib/check_mk_agent/local
+        2. Run check_mk_agent to test it
+        3. Inventorize it on your check_mk server
+            check_mk -II [list of hosts]
+
+    As standalone script:
+        # check_ceph_libs_mk --show
+        {
+          "processes": [
+            {
+              "8872": {
+                "cmdline": "qemu-system-x86_64 [longlistofargs]",
+                "oldmaps": [
+                  "/usr/lib/librados.so.2.0.0 (deleted)",
+                  "/usr/lib/librbd.so.1.0.0 (deleted)"
+                ]
+              }
+            }
+          ]
+        }
+"""
+
+import psutil
+import sys
+import argparse
+import json
+
+CHECK_NAME = 'check_ceph_libs'
+
+T = {
+    'OK': 0,
+    'WARNING': 1,
+    'CRITICAL': 2,
+    'UNKNOWN': 3
+}
+
+# Processes with these names will checked
+PROCS_TO_CHECK = [
+    'archip-radosd',
+    'archip-mapperd',
+    'archip-vlmcd',
+    'qemu-system-x86_64'
+]
+
+# Against which libraries we're going to check
+LIBS_TO_CHECK = [
+    'librados',
+    'librbd'
+]
+
+
+def check_result(msg, status):
+    """
+    Print check result as check_mk's local check convention and exit
+    """
+    print('{} {} - {} - {}'.format(T[status], CHECK_NAME, status, msg))
+    sys.exit(0)
+
+
+def fetch_procs(procs_to_check):
+    """
+    Fetch all processes with name that matches entries in procs_to_check
+    """
+    procs = [
+        p.as_dict()
+        for p in psutil.process_iter()
+        if any(x in p.as_dict()['name'] for x in procs_to_check)
+    ]
+
+    return procs
+
+
+def find_procs_old_libs(procs, libs_to_check):
+    """
+    Check which processes have '(deleted)' shared libs mapped
+
+    This function returns a dictionary of the following format:
+    {
+      "processes": [{
+        pid1: {
+          "oldmaps": [
+            "lib1",
+            "lib2",
+          ],
+          "cmdline": "val1"
+        }
+      },
+      pid2: {
+        [snip]
+      }]
+    }
+    """
+    procs_old_libs = {
+        'processes': []
+    }
+    # Iterate over all procs found above
+    for proc in procs:
+        oldmaps = []
+        # Iterate over all memory maps for given processes
+        for m_map in proc['memory_maps']:
+            # Check only libs we're interested into
+            if any(l in m_map.path for l in libs_to_check):
+                # If map's path contains '(deleted)', the process has an old
+                # library mapped. Append its path to oldmaps list.
+                if '(deleted)' in m_map.path:
+                    oldmaps.append(m_map.path)
+        # If oldmaps contains at least one element, we have to show it.
+        # Append a dict with all proc information and stale mappings. We pass
+        # the stale mappings separately, in order not to filter them again.
+        if oldmaps:
+            procs_old_libs['processes'].append({
+                proc['pid']: {
+                    'oldmaps': oldmaps,
+                    'cmdline': ' '.join(proc['cmdline'])
+                }
+            })
+
+    return procs_old_libs
+
+
+def main():
+    # check_mk local checks do not take arguments, but its useful for the
+    # operator be able to list all processes with wrong libs. So, add a 'hidden'
+    # --show argument, which prints all related procs in JSON format.
+    parser = argparse.ArgumentParser(
+        prog=CHECK_NAME,
+        description='Check if processes are using old Ceph-related libs'
+    )
+    parser.add_argument(
+        '--show',
+        action='store_true',
+        help='Show all processes with stale libs (JSON)'
+    )
+    args = parser.parse_args()
+
+    try:
+        # Fetch all processes using ceph-related libraries
+        procs = fetch_procs(PROCS_TO_CHECK)
+
+        # Find processes running old libraries
+        procs_old_libs = find_procs_old_libs(procs, LIBS_TO_CHECK)
+
+        # If hidden argument is set, print JSON output will all process info,
+        # else behave like a normal local check_mk check.
+        if args.show is True:
+            print(json.dumps(procs_old_libs, indent=2))
+        else:
+            # If at least one process is found, exit with WARNING
+            if len(procs_old_libs['processes']) > 0:
+                check_result('{} processes running with old Ceph libraries.'
+                             .format(len(procs_old_libs['processes'])), 'WARNING')
+            else:
+                check_result('All processes are running latest installed libs', 'OK')
+
+    except Exception as e:
+        check_result('Something went wrong: {}'.format(str(e)), 'UNKNOWN')
+
+
+if __name__ == '__main__':
+    main()
