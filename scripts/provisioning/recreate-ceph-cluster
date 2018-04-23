@@ -1,0 +1,99 @@
+#!/bin/bash
+#
+# recreate-ceph-cluster: Recreate an existing Ceph cluster
+#
+# Used primarily while testing different disk layouts for BlueStore.
+# This script should not written for general usage; maybe someone
+# will find it useful.
+#
+# * Stop all OSDs
+# * Set all OSDs down and purge them
+# * Remove all hosts from crushmap
+# * Ship bluestore_format_disks to all hosts
+# * Run script
+# * Ship gen_lvm_vol_hostvars
+# * Run script
+# * Run ceph-ansible.
+
+set -e
+
+HOSTS=(
+  FOOBAR1
+  FOOBAR2
+)
+ADMIN=FILLME
+
+HDD_COUNT=${1:-12}
+SSD_COUNT=${2:-6}
+DB_PER_SSD=${3:-6}
+SSD_POOL=${4:-yes}
+
+SSH_CMD="sh -o StrictHostKeyChecking=no"
+CEPH_ANSIBLE_DIR="CHANGEME"
+
+echo "=> Fetch OSD IDs"
+OSD_IDS=(`$SSH_CMD $ADMIN sudo ceph osd ls`)
+
+if [[ ! -z "$OSD_IDS" ]];
+then
+    echo "=> Stop all OSDs on all nodes"
+    for host in "${HOSTS[@]}";
+    do
+        echo $host
+        $SSH_CMD $host sudo systemctl stop ceph-osd@*;
+    done
+
+    echo "=> Wait for OSDs to shutdown"
+    sleep 30
+
+    echo "=> Set down and Purge all OSDs"
+    for id in "${OSD_IDS[@]}";
+    do
+        $SSH_CMD $ADMIN sudo ceph osd down $id
+        $SSH_CMD $ADMIN sudo ceph osd purge $id --yes-i-really-mean-it
+    done
+fi
+
+echo "=> Cleanup crushmap"
+CRUSH_HOSTS=(`$SSH_CMD $ADMIN sudo ceph osd crush ls default`)
+for host in "${CRUSH_HOSTS[@]}";
+do
+    $SSH_CMD $ADMIN sudo ceph osd crush rm $host
+done
+
+echo "=> Ship ./bluestore_format_disks to all nodes"
+for host in "${HOSTS[@]}";
+do
+    scp ./bluestore_format_disks $host:
+done
+
+echo "=> Wipe and reformat disks"
+for host in "${HOSTS[@]}";
+do
+    $SSH_CMD $host sudo ./bluestore_format_disks $HDD_COUNT $SSD_COUNT $DB_PER_SSD $SSD_POOL &
+done
+
+wait $(jobs -p)
+
+echo "=> Ship ./gen_lvm_vol_hostvars to all nodes"
+for host in "${HOSTS[@]}";
+do
+    scp ./ $host:
+done
+
+echo "=> Create yaml file with ansible hostvars for lvm"
+for host in "${HOSTS[@]}";
+do
+    $SSH_CMD $host sudo ./gen_lvm_vol_hostvars
+done
+
+echo "=> Copy yaml files to ansible dir"
+for host in "${HOSTS[@]}";
+do
+    scp $host:$host.yml ${CEPH_ANSIBLE_DIR}/host_vars/
+done
+
+
+echo "=> Run ceph-ansible"
+cd $CEPH_ANSIBLE_DIR
+ansible-playbook -i inventory site.yml
