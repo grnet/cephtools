@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""
+ceph-manage-osds: A tool to manage OSDs created with ceph-volume lvm
+
+Description:
+    This tool provides functionality currently missing from ceph-volume:
+    * Enable or disable one or all OSDs on a node
+    * Start or stop one or all OSDs on a node
+
+    By not having any .target units anymore, since ceph-disk is deprecated,
+    we need a way to enable or disable the automatic startup of OSDs on boot,
+    when performing maintenance or debugging.
+
+Requirements:
+    python3
+
+Usage:
+    ceph-manage-osds {enable,disable,start-and-enable,stop} {osd_id,all}
+
+Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+Copyright (c) 2018 GRNET - Greek Research and Technology Network
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+
+import subprocess
+import json
+import re
+import sys
+import argparse
+
+
+def lvm_split_tags(s):
+    """
+    Parse output from LVM2_LV_TAGS from an LV and convert it to a dict.
+    """
+    tags = {}
+    for t in s.split(','):
+        current_tag = t.split('=')
+        name = current_tag[0]
+
+        # It's possible that a tag has not a value
+        if len(current_tag) == 2:
+            value = current_tag[1]
+        else:
+            value = ''
+
+        tags[name] = value
+    return tags
+
+
+def run_process(cmd):
+    """
+    Small wrapper around subprocess.check_output().
+    """
+    try:
+        p = subprocess.check_output(cmd.split(), stderr=subprocess.STDOUT)
+    except Exception as e:
+        print('Error while running {}: {}'.format(' '.join(cmd), str(e)))
+        sys.exit(1)
+
+    return p.decode('utf-8')
+
+
+def discover_osds():
+    """
+    Discover all LVM OSDs on this node.
+    """
+    # Run lvs to get data about all LVs
+    p = run_process('/sbin/lvs --noheadings --nameprefixes -o name,tags')
+
+    # Create list of dicts for all LVs
+    lvs = [
+        dict((m[0], m[1]) for m in re.findall(r"([^\s,=\']*)='([^\']*)'", l))
+            for l in p.splitlines()
+    ]
+
+    # Create a dict containing all osd-block LVs
+    # Format:
+    # {
+    #   'osd_id': {
+    #     'tag1': 'val1',
+    #     'tag2': 'val2',
+    #   },
+    #   'osd_id2: {
+    #   [...]
+    #
+    osds = {}
+    for lv in lvs:
+        if not 'LVM2_LV_TAGS' in lv:
+            print('LVM2_LV_TAGS not found in {}. Exiting.'.format(lv))
+            sys.exit(1)
+
+        # Split tags which come in the following format
+        # tag1=val1,tag2=val2
+        tags = lvm_split_tags(lv['LVM2_LV_TAGS'])
+        # Keep only ceph block LVs:
+        if 'ceph.type' in tags:
+            if tags['ceph.type'] == 'block':
+                osds[tags['ceph.osd_id']] = tags
+
+    return osds
+
+
+def enable_osds(osd):
+    """
+    Enable one or all OSDs.
+
+    This function justs runs systemctl enable for the according units.
+    """
+    osds_lvm = discover_osds()
+    if osd == 'all':
+        for k, v in osds_lvm.items():
+            volume_unit = 'ceph-volume@lvm-{}-{}.service'.format(k, v['ceph.osd_fsid'])
+            print("Enabling {}".format(volume_unit))
+            run_process('/bin/systemctl enable {}'.format(volume_unit))
+    else:
+        if osd.isdigit():
+            if osd not in osds_lvm:
+                print('osd.{} does not exist on this node.'.format(osd))
+                sys.exit(1)
+
+            volume_unit = 'ceph-volume@lvm-{}-{}.service'.format(osd, osds_lvm[osd]['ceph.osd_fsid'])
+            print("Enabling {}".format(volume_unit))
+            run_process('/bin/systemctl enable {}'.format(volume_unit))
+        else:
+            print('Invalid osd number: {}'.format(osd))
+            sys.exit(1)
+
+
+def disable_osds(osd):
+    """
+    Disable one or all OSDs
+    """
+    if osd == 'all':
+        volume_unit = 'ceph-volume@.service'
+        print("Disabling {}".format(volume_unit))
+        run_process('/bin/systemctl disable {}'.format(volume_unit))
+    else:
+        osds_lvm = discover_osds()
+        if osd.isdigit():
+            if osd not in osds_lvm:
+                print('osd.{} does not exist on this node.'.format(osd))
+                sys.exit(1)
+
+            volume_unit = 'ceph-volume@lvm-{}-{}.service'.format(osd, osds_lvm[osd]['ceph.osd_fsid'])
+            print("Disabling {}".format(volume_unit))
+            run_process('/bin/systemctl disable {}'.format(volume_unit))
+        else:
+            print('Invalid osd number: {}'.format(osd))
+            sys.exit(1)
+
+
+def start_and_enable_osds(osd):
+    """
+    Start one or all OSDs.
+
+    We do not know if OSD's tmpfs exist or not; ceph-volume@.service is a one-show
+    service and maybe the operator has unmounted them. That means that we have to
+    use ceph-volume@.service to startup an OSD. This the side-effect of enabling
+    the corresponding systemd unit.
+    """
+    osds_lvm = discover_osds()
+
+    if osd == 'all':
+        for k, v in osds_lvm.items():
+            volume_unit = 'ceph-volume@lvm-{}-{}.service'.format(k, osds_lvm[k]['ceph.osd_fsid'])
+            print("Starting {}".format(volume_unit))
+            run_process('/bin/systemctl start {}'.format(volume_unit))
+    else:
+        if osd.isdigit():
+            volume_unit = 'ceph-volume@lvm-{}-{}.service'.format(osd, osds_lvm[osd]['ceph.osd_fsid'])
+            print("Starting {}".format(volume_unit))
+            run_process('/bin/systemctl start {}'.format(volume_unit))
+        else:
+            print('Invalid osd number: {}'.format(osd))
+            sys.exit(1)
+
+
+def stop_osds(osd):
+    """
+    Stop one or all OSDs
+    """
+    if osd == 'all':
+        osd_unit = 'ceph-osd@*.service'
+        print("Stopping {}".format(osd_unit))
+        run_process('/bin/systemctl stop {}'.format(osd_unit))
+    else:
+        if osd.isdigit():
+            osd_unit = 'ceph-osd@{}.service'.format(osd)
+            print("Stopping {}".format(osd_unit))
+            run_process('/bin/systemctl stop {}'.format(osd_unit))
+        else:
+            print('Invalid osd number: {}'.format(osd))
+            sys.exit(1)
+
+
+def parse_arguments():
+    """
+    Parse command to execute from command line
+    """
+    parser = argparse.ArgumentParser(
+        prog='ceph-manage-osds',
+        description='Tool to manage locally OSDs created with ceph-volume lvm'
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+    )
+
+    subparsers.required = True
+
+    enable = subparsers.add_parser(
+        'enable',
+        help='Enable one or all OSDs on this node'
+    )
+    enable.add_argument('osd', type=str, help='OSD to perform action on', default='all', nargs='?')
+
+    disable = subparsers.add_parser(
+        'disable',
+        help='Enable one or all OSDs on this node'
+    )
+    disable.add_argument('osd', type=str, help='OSD to perform action on', default='all', nargs='?')
+
+    start_and_enable = subparsers.add_parser(
+        'start-and-enable',
+        help='Start and enable one or all OSDs on this node.'
+    )
+    start_and_enable.add_argument('osd', type=str, help='OSD to perform action on', default='all', nargs='?')
+
+    stop = subparsers.add_parser(
+        'stop',
+        help='Stop one or all OSDs on this node'
+    )
+    stop.add_argument('osd', type=str, help='OSD to perform action on', default='all', nargs='?')
+
+    args = parser.parse_args()
+
+    return args
+
+
+def validate_args(args):
+    """
+    Basic command line argument validation.
+
+    Check if osd argument is 'all' or a positive integer
+    """
+    if not re.match(r'^all$', args.osd) and not re.match(r'^[0-9]*$', args.osd):
+        print('Invalid OSD number. Must be "all" or positive integer')
+        sys.exit(1)
+
+
+def main():
+    """
+    Main function for ceph-manage-osds
+    """
+    args = parse_arguments()
+    validate_args(args)
+
+    if args.command == 'enable':
+        enable_osds(args.osd)
+    elif args.command == 'disable':
+        disable_osds(args.osd)
+    elif args.command == 'start-and-enable':
+        start_and_enable_osds(args.osd)
+    elif args.command == 'stop':
+        stop_osds(args.osd)
+
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
