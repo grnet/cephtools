@@ -156,21 +156,23 @@ def find_procs_old_libs(procs, libs_to_check):
     # Iterate over all procs found above
     for proc in procs:
         oldmaps = []
-        # Iterate over all memory maps for given processes
-        for m_map in proc['memory_maps']:
-            # Check only libs we're interested into
-            if any(l in m_map.path for l in libs_to_check):
-                # If map's path contains '(deleted)', the process has an old
-                # library mapped. Append its path to oldmaps list.
-                if '(deleted)' in m_map.path:
-                    oldmaps.append(m_map.path)
+        # Since psutil 4.0.0, '(deleted)' string gets deleted.
+        # There is no way in psutil to find out if the library has
+        # been deleted, other than reading the /proc/[pid]/maps file.
+        mapfile = '/proc/{}/maps'.format(proc['pid'])
+        with open(mapfile, 'r') as f:
+            for line in f:
+                if any(lib in line for lib in libs_to_check):
+                    if '(deleted)' in line:
+                        oldmaps.append(' '.join(line.split()[-2:]))
+
         # If oldmaps contains at least one element, we have to show it.
         # Append a dict with all proc information and stale mappings. We pass
         # the stale mappings separately, in order not to filter them again.
         if oldmaps:
             procs_old_libs['processes'].append({
                 proc['pid']: {
-                    'oldmaps': oldmaps,
+                    'oldmaps': list(set(oldmaps)),
                     'cmdline': ' '.join(proc['cmdline'])
                 }
             })
