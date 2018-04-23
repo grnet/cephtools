@@ -77,7 +77,7 @@ def check_qemu_process(cmdline):
     """
     An ugly function to determine if a QEMU process needs to be checked or not
 
-    Only check QEMU instances with rbd or archipelago disks
+    Only check QEMU instances with rbd disks.
     """
     ret = False
 
@@ -87,10 +87,6 @@ def check_qemu_process(cmdline):
         for disk in results:
             if 'rbd' in disk:
                 ret = True
-            else:
-                if os.path.exists(disk):
-                    if 'tapdev' in os.path.realpath(disk):
-                        ret = True
 
     return ret
 
