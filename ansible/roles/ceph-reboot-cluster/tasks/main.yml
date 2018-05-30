@@ -1,0 +1,72 @@
+# Task that stops Ceph on a node and reboots it
+# Should be used in conjunction with ceph-reboot-cluster playbook.
+#
+# Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+# Copyright (c) 2018 GRNET - Greek Research and Technology Network
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+---
+- name: Wait until cluster is OK with flags set
+  command: /usr/bin/ceph health
+  register: ceph_status
+  until: ceph_status.stdout == warn_flag_msg
+  retries: 30
+  delay: 10
+
+# TODO: GRNET-specific tool, should be used optionally with a flag
+- name: Downtime host
+  command: '/usr/local/bin/ici -dt {{ downtime_duration }}'
+
+- name: Stop all Ceph services
+  service:
+    name: ceph.target
+    state: stopped
+
+- name: Wait until all OSDs are down
+  shell: "pgrep ceph-osd || true"
+  register: osd_procs
+  until: osd_procs.stdout == ""
+  retries: 12
+  delay: 10
+
+- name: Wait until all MONs are down
+  shell: "pgrep ceph-mon || true"
+  register: mon_procs
+  until: mon_procs.stdout == ""
+  retries: 12
+  delay: 10
+
+- name: Wait until all MGRs are down
+  shell: "pgrep ceph-mgr || true"
+  register: mgr_procs
+  until: mgr_procs.stdout == ""
+  retries: 12
+  delay: 10
+
+- name: "Reboot {{ inventory_hostname }}"
+  shell: 'sleep 1 && shutdown -r now "Reboot triggered by Ansible" && sleep 1'
+  async: 1
+  poll: 0
+  ignore_errors: true
+
+- name: Waiting for host to get up
+  wait_for:
+    host: "{{ inventory_hostname }}"
+    delay: 30
+    port: 22
+    timeout: 600
+    search_regex: OpenSSH
+  become: false
+  vars:
+    ansible_connection: local

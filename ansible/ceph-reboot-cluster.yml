@@ -1,0 +1,109 @@
+# ceph-reboot-cluster.yml: Reboot all nodes in a Ceph cluster serially
+#
+# Author: Nikos Kormpakis <nkorb@noc.grnet.gr>
+# Copyright (c) 2018 GRNET - Greek Research and Technology Network
+# 
+# Description:
+#   This playbook reboots serially all nodes in a given Ceph cluster.
+#   It performs the following:
+#   * Check if health is OK
+#   * Set noout etc flags
+#   * For each node:
+#     * Downtime host in Icinga (GRNET-specific)
+#     * Stop all Ceph daemons
+#     * Wait until all daemons are down
+#     * Reboot
+#     * Poll until host gets up
+#     * Wait until everything is up
+#     * Go on to the next node
+#   * Unset cluster flags 
+# 
+# Requirements:
+#   Ansible (>=2.4)
+# 
+# Usage:
+#   ansible-playbook -i ceph_inventory \
+#                       ceph-reboot-cluster.yml \
+#                       --extra-vars "cephcluster=[name]"
+#
+#  [name] should be a tag describing all nodes in a cluster inside inventory
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+---
+- name: Serially reboot a Ceph cluster
+  serial: 1
+  hosts: "{{ cephcluster }}"
+  become: true
+  gather_facts: false
+  vars:
+    downtime_duration: 900
+    warn_flag_msg: "HEALTH_WARN noout,noscrub,nodeep-scrub flag(s) set"
+    ok_msg: "HEALTH_OK"
+
+  pre_tasks:
+    - name: Wait until cluster is HEALTH_OK
+      command: /usr/bin/ceph health
+      register: ceph_status
+      until: (ceph_status.stdout == ok_msg) or
+             (ceph_status.stdout == warn_flag_msg)
+      retries: 12
+      delay: 10
+      run_once: true
+      when:
+        - inventory_hostname == ansible_play_hosts[0]
+
+    - name: Set flags
+      command: /usr/bin/ceph osd set {{ item }}
+      run_once: true
+      when:
+        - inventory_hostname == ansible_play_hosts[0]
+        - ceph_status.stdout == ok_msg
+      with_items:
+        - noout
+        - nodeep-scrub
+        - noscrub
+
+  roles:
+    - ceph-reboot-cluster
+
+  post_tasks:
+    - name: Wait until cluster is OK with flags set
+      command: /usr/bin/ceph health
+      register: ceph_status
+      until: ceph_status.stdout == warn_flag_msg
+      retries: 12
+      delay: 10
+      run_once: true
+      when:
+        - inventory_hostname == ansible_play_hosts[-1]
+
+    - name: Unset flags
+      command: /usr/bin/ceph osd unset {{ item }}
+      run_once: true
+      when:
+        - inventory_hostname == ansible_play_hosts[-1]
+      with_items:
+        - noout
+        - nodeep-scrub
+        - noscrub
+
+    - name: Wait until cluster is HEALTH_OK
+      command: /usr/bin/ceph health
+      register: ceph_status
+      until: ceph_status.stdout == ok_msg
+      retries: 12
+      delay: 10
+      run_once: true
+      when:
+        - inventory_hostname == ansible_play_hosts[-1]
